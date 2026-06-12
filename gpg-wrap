@@ -1,0 +1,348 @@
+#!/usr/bin/env bash
+#
+# gpg-wrap — a friendly wrapper around the gpg CLI.
+#
+# Subcommands:
+#   create   <name> <email> [opts]   Generate a keypair (auto passphrase by default)
+#   list     [pattern]               List keys: fingerprint, uid, dates, has-secret
+#   expire   <key> <when>            Set/clear expiry on a key + all its subkeys
+#   encrypt  <recipient> <file>...   Encrypt files  -> <file>.gpg
+#   decrypt  <file>...               Decrypt files  -> strips .gpg
+#   export   <key> [--secret] [-o f] Export public (or secret) key, armored
+#
+# Global:
+#   -H, --home DIR     Use an isolated keyring dir (or set $GPGW_HOME).
+#                      e.g.  export GPGW_HOME=~/.gnupg-example
+#   -h, --help         This help.
+#
+# Passphrase handling (expire/decrypt/create):
+#   - pass --passphrase VALUE, or set $GPGW_PASSPHRASE, or you'll be prompted.
+#   - passphrases are fed to gpg via --passphrase-fd (never shown in `ps`).
+#   - on `create` with no --passphrase, a strong one is generated and printed ONCE.
+#
+# Examples:
+#   gpg-wrap create "example" example@example.com --expire 1y
+#   gpg-wrap list
+#   gpg-wrap expire example@example.com 1y     # or: never / 2026-12-31 / 90d
+#   gpg-wrap encrypt example@example.com .env accounts.json
+#   gpg-wrap decrypt env.gpg accounts.json.gpg
+#   gpg-wrap export  example@example.com -o pub.asc
+#
+set -euo pipefail
+
+PROG="${0##*/}"
+
+die() { echo "$PROG: $*" >&2; exit 1; }
+
+# help [topic]  — general overview, or detailed help for one subcommand.
+help() {
+  local topic="${1:-}"
+  case "$topic" in
+    create) cat <<EOF
+$PROG create <name> <email> [--bits N] [--expire WHEN] [--passphrase P]
+
+  Generate an RSA keypair (primary + encryption subkey).
+    --bits N         key size in bits (default: 4096)
+    --expire WHEN    never (default) | 1y | 6m | 90d | 2026-12-31
+    --passphrase P   use P instead of auto-generating one
+
+  With no --passphrase a strong 40-char one is generated and printed ONCE.
+  Example: $PROG create "example" example@example.com --expire 1y
+EOF
+      ;;
+    list) cat <<EOF
+$PROG list [pattern]
+
+  List keys with fingerprint, uid, created/expires dates, and whether a
+  secret key is held. Optional [pattern] filters by uid/email/key id.
+  Example: $PROG list example
+EOF
+      ;;
+    expire) cat <<EOF
+$PROG expire <key> <when>
+
+  Set (or clear) the expiry of a key AND all its subkeys in one shot.
+    <key>    uid / email / fingerprint / key id
+    <when>   never | 1y | 6m | 90d | 2026-12-31
+  Needs the key passphrase (--passphrase / \$GPGW_PASSPHRASE / prompt).
+  Example: $PROG expire example@example.com 1y
+EOF
+      ;;
+    encrypt) cat <<EOF
+$PROG encrypt <recipient> <file>...
+
+  Encrypt each file to <recipient>, writing <file>.gpg alongside it.
+  Uses --trust-model always, so an imported public key works without
+  configuring web-of-trust.
+  Example: $PROG encrypt example@example.com .env accounts.json
+EOF
+      ;;
+    decrypt) cat <<EOF
+$PROG decrypt <file>...
+
+  Decrypt each file: <file>.gpg -> <file> (other names -> <file>.dec).
+  Passphrase via --passphrase / \$GPGW_PASSPHRASE / prompt; leave blank to
+  let gpg-agent handle it.
+  Example: $PROG decrypt env.gpg accounts.json.gpg
+EOF
+      ;;
+    export) cat <<EOF
+$PROG export <key> [--secret] [-o file]
+
+  Export a key, ASCII-armored. Public by default (safe to share).
+    --secret      export the PRIVATE key (file is chmod 600; shred after use)
+    -o, --out f   write to file instead of stdout
+  Example: $PROG export example@example.com -o pub.asc
+EOF
+      ;;
+    ""|all|overview)
+      cat <<EOF
+$PROG — a friendly wrapper around the gpg CLI.
+
+Usage: $PROG [-H DIR] <command> [args]
+       $PROG help [command]      detailed help for one command
+
+Commands:
+  create   <name> <email> [opts]   Generate a keypair (auto passphrase by default)
+  list     [pattern]               List keys: fingerprint, uid, dates, has-secret
+  expire   <key> <when>            Set/clear expiry on a key + all its subkeys
+  encrypt  <recipient> <file>...   Encrypt files  -> <file>.gpg
+  decrypt  <file>...               Decrypt files  -> strips .gpg
+  export   <key> [--secret] [-o f] Export public (or secret) key, armored
+
+Global:
+  -H, --home DIR     Use an isolated keyring dir (or set \$GPGW_HOME),
+                     e.g.  export GPGW_HOME=~/.gnupg-example
+  -h, --help         Show this overview.
+
+Passphrase (create/expire/decrypt/export --secret):
+  --passphrase VALUE, or \$GPGW_PASSPHRASE, or interactive prompt.
+  Always fed to gpg via --passphrase-fd, so it never shows up in \`ps\`.
+EOF
+      ;;
+    *)
+      echo "$PROG: no help topic '$topic'. Try: $PROG help" >&2
+      return 1
+      ;;
+  esac
+}
+
+# Back-compat alias.
+usage() { help "$@"; }
+
+# ---- global option parsing ------------------------------------------------
+GPG_HOME="${GPGW_HOME:-}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -H|--home) GPG_HOME="${2:-}"; shift 2 ;;
+    -h|--help) help; exit 0 ;;
+    help|"") shift || true; help "${1:-}"; exit $? ;;
+    --) shift; break ;;
+    -*) die "unknown global option: $1 (try --help)" ;;
+    *) break ;;
+  esac
+done
+
+# Base gpg invocation (honours the isolated home, if any).
+gpg_base=(gpg)
+[[ -n "$GPG_HOME" ]] && gpg_base+=(--homedir "$GPG_HOME")
+
+command -v gpg >/dev/null || die "gpg not found on PATH"
+
+# Resolve a user-supplied key spec (uid/email/short id) to a full fingerprint.
+resolve_fpr() {
+  "${gpg_base[@]}" --list-keys --with-colons "$1" 2>/dev/null \
+    | awk -F: '/^fpr:/{print $10; exit}'
+}
+
+# Cross-platform epoch -> YYYY-MM-DD.
+fmt_date() {
+  local ep="${1:-}"
+  [[ -z "$ep" || "$ep" == 0 ]] && { echo "-"; return; }
+  if date -d "@$ep" +%Y-%m-%d 2>/dev/null; then return; fi   # GNU
+  date -r "$ep" +%Y-%m-%d 2>/dev/null || echo "$ep"          # BSD/macOS
+}
+
+# Acquire a passphrase into $PP (may be empty -> caller falls back to agent).
+PP=""
+get_passphrase() {
+  local prompt="${1:-Passphrase: }"
+  if [[ -n "${opt_passphrase+x}" ]]; then PP="$opt_passphrase"; return; fi
+  if [[ -n "${GPGW_PASSPHRASE:-}" ]]; then PP="$GPGW_PASSPHRASE"; return; fi
+  read -rsp "$prompt" PP </dev/tty; echo >&2
+}
+
+cmd="${1:-}"; shift || true
+[[ -n "$cmd" ]] || { usage; exit 0; }
+
+case "$cmd" in
+
+# ---------------------------------------------------------------- create ---
+create)
+  bits=4096; expire=0; name=""; email=""
+  args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --bits)       bits="$2"; shift 2 ;;
+      --expire)     expire="$2"; shift 2 ;;      # 0/never, 1y, 6m, 90d, 2026-12-31
+      --passphrase) opt_passphrase="$2"; shift 2 ;;
+      -*) die "create: unknown option $1" ;;
+      *)  args+=("$1"); shift ;;
+    esac
+  done
+  name="${args[0]:-}"; email="${args[1]:-}"
+  [[ -n "$name" && -n "$email" ]] || die "usage: $PROG create <name> <email> [--bits N] [--expire WHEN] [--passphrase P]"
+  [[ "$expire" == "never" ]] && expire=0
+
+  if [[ -n "${opt_passphrase+x}" ]]; then
+    PP="$opt_passphrase"; generated=0
+  else
+    command -v openssl >/dev/null || die "openssl needed to auto-generate a passphrase (or pass --passphrase)"
+    PP="$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9')"; PP="${PP:0:40}"; generated=1
+  fi
+
+  echo "Generating ${bits}-bit RSA keypair for '$name <$email>' (30-60s)..." >&2
+  "${gpg_base[@]}" --batch --pinentry-mode loopback --gen-key /dev/stdin <<EOF
+Key-Type: RSA
+Key-Length: ${bits}
+Subkey-Type: RSA
+Subkey-Length: ${bits}
+Name-Real: ${name}
+Name-Email: ${email}
+Expire-Date: ${expire}
+Passphrase: ${PP}
+%commit
+EOF
+
+  fpr="$(resolve_fpr "$email")"
+  [[ -n "$fpr" ]] || die "key not found after generation"
+  echo "✓ Created key: $fpr"
+  if [[ "${generated:-0}" == 1 ]]; then
+    echo
+    echo "  PASSPHRASE (save now — shown only once):"
+    echo "    $PP"
+    echo
+  fi
+  echo "  Next:  $PROG export $email -o ${email%@*}-pub.asc      # share public key"
+  echo "         $PROG export $email --secret -o priv.asc        # back up private key"
+  ;;
+
+# ------------------------------------------------------------------ list ---
+list)
+  pattern=("$@")
+  # set of fingerprints we hold a secret key for
+  sec_set=" $("${gpg_base[@]}" --list-secret-keys --with-colons ${pattern[@]+"${pattern[@]}"} 2>/dev/null \
+                | awk -F: '/^fpr:/{print $10}' | tr '\n' ' ') "
+  "${gpg_base[@]}" --list-keys --with-colons ${pattern[@]+"${pattern[@]}"} 2>/dev/null \
+  | awk -F: '
+      function flush(){ if(fpr!="") printf "%s|%s|%s|%s\n", fpr, uid, created, expires }
+      $1=="pub"||$1=="sec"{ flush(); created=$6; expires=$7; fpr=""; uid="" }
+      $1=="fpr"{ if(fpr=="") fpr=$10 }
+      $1=="uid"{ if(uid=="") { gsub(/\\x3a/,":",$10); uid=$10 } }
+      END{ flush() }
+  ' \
+  | { found=0
+      while IFS='|' read -r fpr uid created expires; do
+        found=1
+        sec="no"; [[ "$sec_set" == *" $fpr "* ]] && sec="yes"
+        exp_s="$([[ -z "$expires" || "$expires" == 0 ]] && echo "never" || fmt_date "$expires")"
+        echo "$fpr"
+        printf '    uid:     %s\n' "${uid:-(none)}"
+        printf '    created: %s    expires: %s    secret: %s\n' "$(fmt_date "$created")" "$exp_s" "$sec"
+      done
+      [[ "$found" == 1 ]] || echo "(no keys${pattern:+ matching: ${pattern[*]}})"
+    }
+  ;;
+
+# ---------------------------------------------------------------- expire ---
+expire)
+  key="${1:-}"; when="${2:-}"
+  [[ -n "$key" && -n "$when" ]] || die "usage: $PROG expire <key> <when>   (when: never | 1y | 6m | 90d | 2026-12-31)"
+  [[ "$when" == "never" ]] && when=0
+  fpr="$(resolve_fpr "$key")"; [[ -n "$fpr" ]] || die "no key matching '$key'"
+
+  get_passphrase "Passphrase for $key: "
+  set_expire() {  # $1 = subkey selector ("" for primary, "*" for all subkeys)
+    if [[ -n "$PP" ]]; then
+      "${gpg_base[@]}" --batch --yes --pinentry-mode loopback --passphrase-fd 3 \
+        --quick-set-expire "$fpr" "$when" ${1:+"$1"} 3<<<"$PP"
+    else
+      "${gpg_base[@]}" --batch --yes --quick-set-expire "$fpr" "$when" ${1:+"$1"}
+    fi
+  }
+  set_expire ""      # primary key
+  set_expire "*"     # all subkeys
+  echo "✓ Expiry for $fpr set to: $([[ "$when" == 0 ]] && echo never || echo "$when")"
+  "$0" ${GPG_HOME:+--home "$GPG_HOME"} list "$fpr"
+  ;;
+
+# --------------------------------------------------------------- encrypt ---
+encrypt)
+  recipient="${1:-}"; shift || true
+  [[ -n "$recipient" && $# -gt 0 ]] || die "usage: $PROG encrypt <recipient> <file>..."
+  for f in "$@"; do
+    [[ -f "$f" ]] || die "no such file: $f"
+    out="$f.gpg"
+    "${gpg_base[@]}" --batch --yes --trust-model always \
+      -r "$recipient" -o "$out" --encrypt "$f"
+    echo "✓ $f -> $out"
+  done
+  ;;
+
+# --------------------------------------------------------------- decrypt ---
+decrypt)
+  [[ $# -gt 0 ]] || die "usage: $PROG decrypt <file>..."
+  get_passphrase "Passphrase (blank = use gpg-agent): "
+  for f in "$@"; do
+    [[ -f "$f" ]] || die "no such file: $f"
+    case "$f" in *.gpg) out="${f%.gpg}" ;; *) out="$f.dec" ;; esac
+    if [[ -n "$PP" ]]; then
+      "${gpg_base[@]}" --batch --yes --pinentry-mode loopback --passphrase-fd 3 \
+        -o "$out" --decrypt "$f" 3<<<"$PP"
+    else
+      "${gpg_base[@]}" --batch --yes -o "$out" --decrypt "$f"
+    fi
+    echo "✓ $f -> $out"
+  done
+  ;;
+
+# ---------------------------------------------------------------- export ---
+export)
+  key="${1:-}"; shift || true
+  [[ -n "$key" ]] || die "usage: $PROG export <key> [--secret] [-o file]"
+  secret=0; outfile=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --secret) secret=1; shift ;;
+      -o|--out) outfile="$2"; shift 2 ;;
+      -*) die "export: unknown option $1" ;;
+      *) die "export: unexpected arg $1" ;;
+    esac
+  done
+  fpr="$(resolve_fpr "$key")"; [[ -n "$fpr" ]] || die "no key matching '$key'"
+
+  if [[ "$secret" == 1 ]]; then
+    get_passphrase "Passphrase for $key: "
+    gen=("${gpg_base[@]}" --armor --batch --yes)
+    [[ -n "$PP" ]] && gen+=(--pinentry-mode loopback --passphrase-fd 3)
+    if [[ -n "$outfile" ]]; then
+      ( umask 077; "${gen[@]}" --export-secret-keys "$fpr" 3<<<"$PP" > "$outfile" )
+      chmod 600 "$outfile"
+      echo "✓ secret key -> $outfile (chmod 600 — shred it after backup: shred -u $outfile)"
+    else
+      "${gen[@]}" --export-secret-keys "$fpr" 3<<<"$PP"
+    fi
+  else
+    if [[ -n "$outfile" ]]; then
+      "${gpg_base[@]}" --armor --export "$fpr" > "$outfile"
+      echo "✓ public key -> $outfile (safe to share)"
+    else
+      "${gpg_base[@]}" --armor --export "$fpr"
+    fi
+  fi
+  ;;
+
+*)
+  die "unknown command: $cmd (try: $PROG --help)"
+  ;;
+esac
